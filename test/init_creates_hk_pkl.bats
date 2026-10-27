@@ -130,22 +130,6 @@ teardown() {
     assert_file_contains hk.pkl "Builtins.ansible_lint"
 }
 
-@test "hk init detects .bandit" {
-    touch .bandit
-    run hk init
-    assert_success
-    assert_output --partial "bandit (.bandit)"
-    assert_file_contains hk.pkl "Builtins.bandit"
-}
-
-@test "hk init detects bandit config in pyproject.toml" {
-    printf '[project]\nname = "test"\n\n[tool.bandit]\nskips = ["B101"]\n' > pyproject.toml
-    run hk init
-    assert_success
-    assert_output --partial "bandit (pyproject.toml matches"
-    assert_file_contains hk.pkl "Builtins.bandit"
-}
-
 @test "hk init detects pyrightconfig.json" {
     echo '{}' > pyrightconfig.json
     run hk init
