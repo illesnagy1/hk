@@ -1,0 +1,140 @@
+import "../Builtins.pkl"
+import "../Config.pkl"
+import "./test/helpers.pkl"
+
+@Builtins.meta {
+  category = "Infrastructure"
+  description = "Misconfiguration scanner for Terraform, Dockerfiles, Kubernetes and other IaC"
+  project_indicators {
+    new { file = "trivy.yaml" }
+    new { file = ".trivyignore" }
+    new { file = ".trivyignore.yaml" }
+  }
+}
+// `trivy config` accepts exactly one target ("multiple targets cannot be specified"), and
+// Terraform needs its whole module directory: scanning main.tf alone misses findings whose
+// values come from variables.tf. So this scans the working tree once, like gitleaks, and the
+// glob only decides when it runs. Findings in unselected files fail the check too.
+// trivy reads trivy.yaml and .trivyignore from the repository root. It does not skip
+// node_modules or vendor directories; set `scan.skip-dirs` in trivy.yaml to exclude them.
+// trivy downloads its checks bundle on first use and refreshes it daily, falling back to the
+// checks embedded in the binary when offline.
+trivy_config = new Config.Step {
+  glob =
+    List(
+      "**/*.tf",
+      "**/*.tf.json",
+      "**/*.tfvars",
+      "**/*.tofu",
+      "**/Dockerfile*",
+      "**/*.Dockerfile",
+      "**/Containerfile*",
+      "**/*.Containerfile",
+      "**/*.yaml",
+      "**/*.yml",
+      "**/*.json",
+      "**/*.tpl",
+      "**/.trivyignore",
+    )
+  // trivy exits 0 when it finds misconfigurations unless --exit-code is set.
+  check = new Config.CommandSpec {
+    command = new Config.Command { argv = List("trivy", "config", "--exit-code", "1", ".") }
+    effect = "read"
+  }
+  tests {
+    // Use the checks embedded in the pinned trivy binary: no network, and no dependence on a
+    // checks bundle cached on the machine. The cache directory is never created.
+    local const trivyEnv = new Mapping<String, String> {
+      ["TRIVY_CACHE_DIR"] = ".trivy-test-cache"
+      ["TRIVY_SKIP_CHECK_UPDATE"] = "true"
+      ["TRIVY_SKIP_VERSION_CHECK"] = "true"
+      ["TRIVY_DISABLE_TELEMETRY"] = "true"
+    }
+    local const goodDockerfile =
+      """
+      FROM alpine:3.20
+      USER nobody
+      HEALTHCHECK CMD true
+
+      """
+    local const badDockerfile =
+      """
+      FROM alpine:3.20
+      RUN echo hello
+
+      """
+    local const testMaker = new helpers.TestMaker {
+      filename = "Dockerfile"
+      env = trivyEnv
+    }
+    ["check good Dockerfile"] = testMaker.checkPass(goodDockerfile)
+    ["check Dockerfile running as root"] = testMaker.checkFail(badDockerfile, 1)
+    ["check Kubernetes manifest"] =
+      testMaker
+        .withFilename("k8s/pod.yaml")
+        .checkFail(
+          """
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: example
+          spec:
+            containers:
+              - name: app
+                image: nginx:latest
+
+          """,
+          1,
+        )
+    ["check plain YAML"] = testMaker.withFilename("config.yaml").checkPass("key: value\n")
+    // main.tf alone leaves var.encrypted unknown and reports AWS-0026; the module's
+    // variables.tf decides the result.
+    local const ebsVolume =
+      """
+      resource "aws_ebs_volume" "example" {
+        availability_zone = "us-east-1a"
+        size              = 1
+        encrypted         = var.encrypted
+        kms_key_id        = "arn:aws:kms:us-east-1:123456789012:key/example"
+      }
+
+      """
+    local function terraformModule(encrypted: Boolean) = new helpers.TestMaker {
+      filename = "main.tf"
+      env = trivyEnv
+      extra_files {
+        ["variables.tf"] =
+          """
+          variable "encrypted" {
+            type    = bool
+            default = \(encrypted)
+          }
+
+          """
+      }
+    }
+    ["check Terraform module variable"] = terraformModule(true).checkPass(ebsVolume)
+    ["check unencrypted Terraform volume"] = terraformModule(false).checkFail(ebsVolume, 1)
+    ["check honors .trivyignore"] =
+      (
+        new helpers.TestMaker {
+          filename = "Dockerfile"
+          env = trivyEnv
+          extra_files {
+            [".trivyignore"] = "DS-0002\nDS-0026\n"
+          }
+        }
+      ).checkPass(badDockerfile)
+    ["check whole tree beyond selected files"] =
+      (
+        new helpers.TestMaker {
+          filename = "Dockerfile"
+          files = List("ok.Dockerfile")
+          env = trivyEnv
+          extra_files {
+            ["ok.Dockerfile"] = goodDockerfile
+          }
+        }
+      ).checkFail(badDockerfile, 1)
+  }
+}

@@ -130,6 +130,14 @@ teardown() {
     assert_file_contains hk.pkl "Builtins.ansible_lint"
 }
 
+@test "hk init detects .trivyignore" {
+    touch .trivyignore
+    run hk init
+    assert_success
+    assert_output --partial "trivy_config (.trivyignore)"
+    assert_file_contains hk.pkl "Builtins.trivy_config"
+}
+
 @test "hk init generates default template when nothing detected" {
     run hk init
     assert_success
